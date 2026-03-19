@@ -38,21 +38,8 @@ class FloorPlanConfig:
     min_wall_length: float = 0.3     # metres
     classes_structural: list[int] = field(default_factory=lambda: [1, 2])
     classes_openings: list[int] = field(default_factory=lambda: [5, 6])
-    wall_class_id: int | None = None
-    window_class_id: int | None = None
-    door_class_id: int | None = None
     morphology_kernel: int = 5
-    morph_dilate_iterations: int = 2
-    morph_erode_iterations: int = 1
-    hough_threshold: int = 50
-    hough_max_gap: float = 0.15
-    dbscan_eps: float = 0.3
-    dbscan_min_samples: int = 5
-    canvas_margin: float = 0.1
     output_dpi: int = 150
-    scale_bar_length_m: float = 1.0
-    scale_bar_margin_px: int = 20
-    scale_bar_font_scale: float = 0.4
     snap_angle_tolerance: float = 5.0   # degrees
     snap_distance: float = 0.05         # metres – merge nearby endpoints
 
@@ -115,18 +102,12 @@ class FloorPlanGenerator:
 
         # 1. Extract structural points (walls + floor for outline)
         struct_mask = np.isin(labels, cfg.classes_structural)
-        # Prefer explicit class IDs; fallback to list conventions.
-        wall_class = cfg.wall_class_id
-        if wall_class is None:
-            wall_class = cfg.classes_structural[-1] if cfg.classes_structural else 2
+        # Use the last structural class as wall (convention: [floor, wall])
+        wall_class = cfg.classes_structural[-1] if cfg.classes_structural else 2
         wall_mask = (labels == wall_class)
-        # classes_openings default convention: [window, door]
-        window_class = cfg.window_class_id
-        if window_class is None:
-            window_class = cfg.classes_openings[0] if len(cfg.classes_openings) > 0 else None
-        door_class = cfg.door_class_id
-        if door_class is None:
-            door_class = cfg.classes_openings[1] if len(cfg.classes_openings) > 1 else None
+        # classes_openings convention: [window, door]
+        window_class = cfg.classes_openings[0] if len(cfg.classes_openings) > 0 else None
+        door_class = cfg.classes_openings[1] if len(cfg.classes_openings) > 1 else None
         door_mask = (labels == door_class) if door_class is not None else np.zeros(len(labels), dtype=bool)
         window_mask = (labels == window_class) if window_class is not None else np.zeros(len(labels), dtype=bool)
 
@@ -141,8 +122,8 @@ class FloorPlanGenerator:
 
         # 3. Set up canvas
         all_xy = xyz[:, :2]
-        origin = all_xy.min(axis=0) - cfg.canvas_margin
-        extent = all_xy.max(axis=0) + cfg.canvas_margin
+        origin = all_xy.min(axis=0) - 0.1  # small margin
+        extent = all_xy.max(axis=0) + 0.1
         canvas_size = ((extent - origin) / cfg.resolution).astype(int) + 1
         H, W = int(canvas_size[1]), int(canvas_size[0])
 
@@ -159,8 +140,8 @@ class FloorPlanGenerator:
             cv2.MORPH_RECT,
             (cfg.morphology_kernel, cfg.morphology_kernel),
         )
-        wall_img = cv2.dilate(wall_img, kernel, iterations=cfg.morph_dilate_iterations)
-        wall_img = cv2.erode(wall_img, kernel, iterations=cfg.morph_erode_iterations)
+        wall_img = cv2.dilate(wall_img, kernel, iterations=2)
+        wall_img = cv2.erode(wall_img, kernel, iterations=1)
         wall_img = cv2.morphologyEx(wall_img, cv2.MORPH_CLOSE, kernel)
 
         # 6. Detect line segments (Probabilistic Hough)
@@ -169,9 +150,9 @@ class FloorPlanGenerator:
             wall_img,
             rho=1,
             theta=np.pi / 180,
-            threshold=cfg.hough_threshold,
+            threshold=50,
             minLineLength=min_line_px,
-            maxLineGap=int(cfg.hough_max_gap / cfg.resolution),
+            maxLineGap=int(0.15 / cfg.resolution),
         )
 
         wall_segments = []
@@ -274,10 +255,7 @@ class FloorPlanGenerator:
         if xy.shape[0] < 3:
             return []
 
-        clustering = DBSCAN(
-            eps=self.cfg.dbscan_eps,
-            min_samples=self.cfg.dbscan_min_samples,
-        ).fit(xy)
+        clustering = DBSCAN(eps=0.3, min_samples=5).fit(xy)
         segments = []
         for cid in set(clustering.labels_):
             if cid == -1:
@@ -348,9 +326,9 @@ class FloorPlanGenerator:
                      color=(200, 200, 0), thickness=1)
 
         # Draw scale bar (bottom-right)
-        bar_length_m = cfg.scale_bar_length_m
+        bar_length_m = 1.0
         bar_length_px = int(bar_length_m / cfg.resolution)
-        margin = cfg.scale_bar_margin_px
+        margin = 20
         if W > bar_length_px + 2 * margin and H > 40:
             bx2 = W - margin
             bx1 = bx2 - bar_length_px
@@ -360,7 +338,7 @@ class FloorPlanGenerator:
             cv2.line(img, (bx2, by - 5), (bx2, by + 5), (0, 0, 0), 2)
             cv2.putText(img, f"{bar_length_m:.0f} m",
                         (bx1, by - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                        cfg.scale_bar_font_scale, (0, 0, 0), 1, cv2.LINE_AA)
+                        0.4, (0, 0, 0), 1, cv2.LINE_AA)
 
         return img
 

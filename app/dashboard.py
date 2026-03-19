@@ -35,7 +35,8 @@ from src.data.s3dis_dataset import (
     CLASS_COLOURS,
     NUM_CLASSES,
 )
-from src.pipeline.floorplan import FloorPlan, FloorPlanConfig, FloorPlanGenerator
+from src.models.pointnet import build_model
+from src.pipeline.floorplan import FloorPlanConfig, FloorPlanGenerator
 from src.pipeline.segmentation import Segmentor
 
 # ──────────────────────────────────────────────
@@ -43,6 +44,7 @@ from src.pipeline.segmentation import Segmentor
 # ──────────────────────────────────────────────
 
 CONFIG_PATH = ROOT / "configs" / "default.yaml"
+SUPPORTED_EXTENSIONS = (".txt", ".npy", ".ply")
 
 # CSS colours matching CLASS_COLOURS for Plotly
 _CLASS_CSS = [
@@ -146,7 +148,7 @@ def build_floorplan(
     points: np.ndarray,
     labels: np.ndarray,
     fp_cfg_dict: dict,
-) -> tuple[np.ndarray, FloorPlan]:
+) -> np.ndarray:
     """Generate a 2D floor plan image (RGB) from segmented points."""
     fp_cfg = FloorPlanConfig(
         resolution=fp_cfg_dict.get("resolution", 0.02),
@@ -154,21 +156,8 @@ def build_floorplan(
         min_wall_length=fp_cfg_dict.get("min_wall_length", 0.3),
         classes_structural=fp_cfg_dict.get("classes_structural", [1, 2]),
         classes_openings=fp_cfg_dict.get("classes_openings", [5, 6]),
-        wall_class_id=fp_cfg_dict.get("wall_class_id"),
-        window_class_id=fp_cfg_dict.get("window_class_id"),
-        door_class_id=fp_cfg_dict.get("door_class_id"),
         morphology_kernel=fp_cfg_dict.get("morphology_kernel", 5),
-        morph_dilate_iterations=fp_cfg_dict.get("morph_dilate_iterations", 2),
-        morph_erode_iterations=fp_cfg_dict.get("morph_erode_iterations", 1),
-        hough_threshold=fp_cfg_dict.get("hough_threshold", 50),
-        hough_max_gap=fp_cfg_dict.get("hough_max_gap", 0.15),
-        dbscan_eps=fp_cfg_dict.get("dbscan_eps", 0.3),
-        dbscan_min_samples=fp_cfg_dict.get("dbscan_min_samples", 5),
-        canvas_margin=fp_cfg_dict.get("canvas_margin", 0.1),
         output_dpi=fp_cfg_dict.get("output_dpi", 150),
-        scale_bar_length_m=fp_cfg_dict.get("scale_bar_length_m", 1.0),
-        scale_bar_margin_px=fp_cfg_dict.get("scale_bar_margin_px", 20),
-        scale_bar_font_scale=fp_cfg_dict.get("scale_bar_font_scale", 0.4),
         snap_angle_tolerance=fp_cfg_dict.get("snap_angle_tolerance", 5.0),
         snap_distance=fp_cfg_dict.get("snap_distance", 0.05),
     )
@@ -222,20 +211,10 @@ def main():
             format_func=lambda p: p.name,
         )
 
-        # Auto-detect model architecture from checkpoint when available.
-        try:
-            _ckpt_meta = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-            model_name = _ckpt_meta.get("model_name", model_cfg["name"])
-            if "model_name" in _ckpt_meta:
-                st.info(f"Model: **{model_name}** (from checkpoint)")
-            else:
-                st.warning(
-                    "This checkpoint does not store model metadata. "
-                    f"Using config fallback: {model_name}."
-                )
-        except Exception as e:
-            st.error(f"Failed to read checkpoint metadata: {e}")
-            st.stop()
+        # Auto-detect model architecture from checkpoint
+        _ckpt_meta = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        model_name = _ckpt_meta.get("model_name", model_cfg["name"])
+        st.info(f"Model: **{model_name}** (from checkpoint)")
 
         st.divider()
 
@@ -267,20 +246,12 @@ def main():
 
     # ── Run pipeline ────────────────────────────
     with st.spinner("Loading model…"):
-        try:
-            segmentor = load_segmentor(
-                checkpoint=str(ckpt_path),
-                model_name=model_name,
-                input_channels=model_cfg["input_channels"],
-                num_classes=ds_cfg["num_classes"],
-            )
-        except Exception as e:
-            st.error(
-                "Model loading failed. This usually means the selected checkpoint "
-                "does not match the expected architecture or classes. "
-                f"Details: {e}"
-            )
-            st.stop()
+        segmentor = load_segmentor(
+            checkpoint=str(ckpt_path),
+            model_name=model_name,
+            input_channels=model_cfg["input_channels"],
+            num_classes=ds_cfg["num_classes"],
+        )
 
     with st.spinner("Running semantic segmentation…"):
         raw_points, labels = run_segmentation(
