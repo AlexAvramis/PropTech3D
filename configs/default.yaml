@@ -1,0 +1,44 @@
+# ──────────────────────────────────────────────
+#  PropTech3D – Default Configuration
+# ──────────────────────────────────────────────
+
+dataset:
+  name: s3dis
+  root: data/S3DIS                    # raw Stanford dataset root
+  processed: data/processed           # cached HDF5 files
+  test_area: 5                        # area held out for testing (1-6)
+  num_points: 4096                    # points sampled per block
+  block_size: 1.0                     # spatial block size (metres)
+  stride: 0.5                         # block stride (metres)
+  num_classes: 13
+
+model:
+  name: pointnet                      # pointnet | pointnet2
+  input_channels: 9                   # XYZ + RGB + normalised XYZ
+  dropout: 0.3
+
+train:
+  epochs: 100
+  batch_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler:
+    name: cosine                      # cosine | step
+    T_max: 100
+  num_workers: 4
+
+floorplan:
+  resolution: 0.02                    # metres per pixel
+  wall_thickness: 3                   # pixels
+  min_wall_length: 0.3                # metres – discard short segments
+  classes_structural: [1, 2]          # floor, wall indices
+  classes_openings: [5, 6]            # window, door indices
+  morphology_kernel: 5               # px – clean-up kernel size
+  output_dpi: 150
+  snap_angle_tolerance: 5.0          # degrees – snap near-axis lines
+  snap_distance: 0.05                # metres – merge nearby endpoints
+
+paths:
+  checkpoints: checkpoints/
+  outputs: outputs/
+  logs: logs/
