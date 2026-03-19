@@ -30,9 +30,17 @@ def main():
     parser = argparse.ArgumentParser(description="Train segmentation model")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--resume", default=None, help="Path to checkpoint to resume")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override number of training epochs")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    if args.epochs is not None:
+        cfg["train"]["epochs"] = args.epochs
+        # Keep cosine scheduler T_max in sync
+        if cfg["train"]["scheduler"]["name"] == "cosine":
+            cfg["train"]["scheduler"]["T_max"] = args.epochs
 
     print("=" * 60)
     print("  PropTech3D  –  Training")

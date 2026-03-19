@@ -103,7 +103,9 @@ class Trainer:
             )
         else:
             self.scheduler = torch.optim.lr_scheduler.StepLR(
-                self.optimizer, step_size=30, gamma=0.5
+                self.optimizer,
+                step_size=sched_cfg.get("step_size", 30),
+                gamma=sched_cfg.get("gamma", 0.5),
             )
 
         # Paths
@@ -190,6 +192,7 @@ class Trainer:
     def _save(self, epoch: int, metrics: dict, path: Path):
         torch.save({
             "epoch": epoch,
+            "model_name": self.cfg["model"]["name"],
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),

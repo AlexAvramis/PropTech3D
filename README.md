@@ -33,13 +33,14 @@ End-to-end deep learning pipeline that takes a **raw 3D point cloud** of an indo
 
 ```
 PropTech3D/
+├── app/
+│   └── dashboard.py           # Streamlit visualizer (3D + floor plan)
 ├── configs/
 │   └── default.yaml           # All hyper-parameters
 ├── scripts/
 │   ├── preprocess.py          # S3DIS → HDF5 blocks
 │   ├── train.py               # Train segmentation model
-│   ├── generate_floorplan.py  # End-to-end inference + floor plan
-│   └── generate_synthetic.py  # Generate synthetic S3DIS-style test data
+│   └── generate_floorplan.py  # End-to-end inference + floor plan
 ├── src/
 │   ├── data/
 │   │   └── s3dis_dataset.py   # Dataset loader & block sampler
@@ -93,6 +94,18 @@ python -m scripts.preprocess --config configs/default.yaml
 python -m scripts.train --config configs/default.yaml
 ```
 
+Quick smoke-test with a single epoch:
+
+```bash
+python -m scripts.train --config configs/default.yaml --epochs 1
+```
+
+Resume from a checkpoint:
+
+```bash
+python -m scripts.train --config configs/default.yaml --resume checkpoints/latest.pth
+```
+
 Training uses **Area 5** as the test set by default (standard S3DIS protocol). Key hyper-parameters:
 
 | Parameter       | Default |
@@ -116,8 +129,14 @@ python -m scripts.generate_floorplan \
 
 # Also supports .ply, .txt (XYZRGB), or .npy files:
 python -m scripts.generate_floorplan \
-    --room my_scan.ply \
+    --room my_scan.txt \
     --checkpoint checkpoints/best.pth
+
+# Override model architecture or device:
+python -m scripts.generate_floorplan \
+    --room my_scan.npy \
+    --checkpoint checkpoints/best.pth \
+    --model pointnet2 --device cuda
 ```
 
 **Outputs** (in `outputs/`):
@@ -129,6 +148,67 @@ python -m scripts.generate_floorplan \
 | `<room>_segmented_topdown.png` | Colour-coded semantic segmentation (XY) |
 | `<room>_segmented_3d.png` | Colour-coded 3D view |
 | `<room>_floorplan_plot.png` | Matplotlib figure of the floor plan |
+
+### 5. Visualizer Dashboard
+
+Interactive Streamlit app with a split-screen view: 3D segmented room on the left, 2D floor plan on the right.
+
+```bash
+streamlit run app/dashboard.py
+```
+
+The dashboard lets you:
+
+- Upload a point cloud file (`.txt`, `.npy`, or `.ply`)
+- Select a trained checkpoint; model architecture is auto-detected from checkpoint metadata
+- View an interactive, colour-coded 3D Plotly scatter of the segmented room
+- View the generated 2D floor plan blueprint side-by-side
+- Inspect per-class point distributions and summary metrics
+
+A trained checkpoint must exist in `checkpoints/` before launching.
+
+---
+
+## Script Reference
+
+### `scripts/preprocess.py`
+
+Converts raw S3DIS room directories into per-area HDF5 block caches.
+
+| Argument    | Required | Default                  | Description                 |
+|-------------|----------|--------------------------|-----------------------------|
+| `--config`  | No       | `configs/default.yaml`   | Path to YAML config file    |
+
+### `scripts/train.py`
+
+Trains the PointNet / PointNet++ segmentation model.
+
+| Argument    | Required | Default                  | Description                              |
+|-------------|----------|--------------------------|------------------------------------------|
+| `--config`  | No       | `configs/default.yaml`   | Path to YAML config file                 |
+| `--resume`  | No       | —                        | Path to checkpoint to resume training    |
+| `--epochs`  | No       | from config (100)        | Override number of epochs (also updates cosine scheduler `T_max`) |
+
+### `scripts/generate_floorplan.py`
+
+Runs inference on a point cloud and generates the 2D floor plan.
+
+| Argument       | Required | Default                  | Description                                    |
+|----------------|----------|--------------------------|------------------------------------------------|
+| `--room`       | **Yes**  | —                        | Path to room dir, `.ply`, `.txt`, or `.npy`    |
+| `--checkpoint` | **Yes**  | —                        | Path to model checkpoint (`.pth`)              |
+| `--config`     | No       | `configs/default.yaml`   | Path to YAML config file                       |
+| `--output`     | No       | `outputs/`               | Output directory                               |
+| `--model`      | No       | from config              | Override model name (`pointnet` / `pointnet2`) |
+| `--device`     | No       | auto                     | Force device (`cuda` / `cpu`)                  |
+
+### `app/dashboard.py`
+
+Streamlit visualizer dashboard. No CLI arguments — all settings are controlled via the sidebar in the browser.
+
+```bash
+streamlit run app/dashboard.py
+```
 
 ## Floor Plan Generation Pipeline
 
@@ -171,6 +251,6 @@ model:
 | Format | Details |
 |--------|---------|
 | S3DIS directory | Room folder with `Annotations/*.txt` |
-| `.ply` | Read via Open3D (XYZ + RGB) |
+| `.ply` | Requires [open3d](https://pypi.org/project/open3d/) (Python <=3.12). Convert to `.txt` or `.npy` if unavailable. |
 | `.txt` | Space-separated `X Y Z R G B` per line |
 | `.npy` | NumPy array of shape `(N, 6)` |

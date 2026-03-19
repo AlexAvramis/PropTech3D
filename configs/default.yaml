@@ -13,7 +13,7 @@ dataset:
   num_classes: 13
 
 model:
-  name: pointnet                      # pointnet | pointnet2
+  name: pointnet2                     # pointnet | pointnet2
   input_channels: 9                   # XYZ + RGB + normalised XYZ
   dropout: 0.3
 
@@ -25,16 +25,29 @@ train:
   scheduler:
     name: cosine                      # cosine | step
     T_max: 100
-  num_workers: 4
+  num_workers: 0
 
 floorplan:
   resolution: 0.02                    # metres per pixel
   wall_thickness: 3                   # pixels
   min_wall_length: 0.3                # metres – discard short segments
-  classes_structural: [1, 2]          # floor, wall indices
-  classes_openings: [5, 6]            # window, door indices
-  morphology_kernel: 5               # px – clean-up kernel size
+  classes_structural: [1, 2]          # fallback order: [floor, wall]
+  classes_openings: [5, 6]            # fallback order: [window, door]
+  wall_class_id: 2                    # explicit wall class override (optional)
+  window_class_id: 5                  # explicit window class override (optional)
+  door_class_id: 6                    # explicit door class override (optional)
+  morphology_kernel: 5                # px – clean-up kernel size
+  morph_dilate_iterations: 2
+  morph_erode_iterations: 1
+  hough_threshold: 50
+  hough_max_gap: 0.15                 # metres
+  dbscan_eps: 0.3                     # metres
+  dbscan_min_samples: 5
+  canvas_margin: 0.1                  # metres around scan bounds
   output_dpi: 150
+  scale_bar_length_m: 1.0
+  scale_bar_margin_px: 20
+  scale_bar_font_scale: 0.4
   snap_angle_tolerance: 5.0          # degrees – snap near-axis lines
   snap_distance: 0.05                # metres – merge nearby endpoints
 

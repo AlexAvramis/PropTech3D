@@ -34,6 +34,10 @@ class Segmentor:
 
         self.model = build_model(model_name, input_channels, num_classes)
         ckpt = torch.load(checkpoint, map_location=self.device, weights_only=False)
+        # Auto-detect model architecture from checkpoint if available
+        saved_name = ckpt.get("model_name")
+        if saved_name and saved_name != model_name:
+            self.model = build_model(saved_name, input_channels, num_classes)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model.to(self.device).eval()
 
