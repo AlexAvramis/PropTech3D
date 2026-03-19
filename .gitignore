@@ -1,0 +1,27 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training and app artifacts
+checkpoints/
+logs/
+outputs/
+.streamlit/
+
+# Datasets and processed caches
+data/S3DIS/
+data/processed/
+
+# Notebook and editor state
+.ipynb_checkpoints/
+.vscode/
+
+# OS files
+Thumbs.db
+.DS_Store
