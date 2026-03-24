@@ -44,17 +44,12 @@ def main():
     print("=" * 60)
     print(f"  Raw root       : {ds['root']}")
     print(f"  Processed dir  : {ds['processed']}")
-    print(f"  Block size     : {ds['block_size']} m")
-    print(f"  Stride         : {ds['stride']} m")
-    print(f"  Num points     : {ds['num_points']}")
+    print(f"  Stores full rooms (blocking happens on-the-fly during training)")
     print()
 
     preprocess_and_cache(
         root=ds["root"],
         out_dir=ds["processed"],
-        num_points=ds["num_points"],
-        block_size=ds["block_size"],
-        stride=ds["stride"],
     )
 
     print("\nPreprocessing complete.")

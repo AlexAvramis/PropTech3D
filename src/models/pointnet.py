@@ -393,10 +393,13 @@ def pointnet_loss(
     labels: torch.Tensor,
     feat_transform: torch.Tensor | None = None,
     reg_weight: float = 0.001,
+    class_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-entropy + optional feature-transform regularisation."""
     B, N, C = logits.shape
-    ce = F.cross_entropy(logits.reshape(-1, C), labels.reshape(-1))
+    ce = F.cross_entropy(
+        logits.reshape(-1, C), labels.reshape(-1), weight=class_weights
+    )
     if feat_transform is not None:
         k = feat_transform.shape[1]
         eye = torch.eye(k, device=feat_transform.device).unsqueeze(0)

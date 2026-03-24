@@ -157,9 +157,17 @@ def build_floorplan(
         classes_structural=fp_cfg_dict.get("classes_structural", [1, 2]),
         classes_openings=fp_cfg_dict.get("classes_openings", [5, 6]),
         morphology_kernel=fp_cfg_dict.get("morphology_kernel", 5),
+        morph_dilate_iterations=fp_cfg_dict.get("morph_dilate_iterations", 1),
+        morph_erode_iterations=fp_cfg_dict.get("morph_erode_iterations", 1),
+        hough_threshold=fp_cfg_dict.get("hough_threshold", 30),
+        hough_max_gap=fp_cfg_dict.get("hough_max_gap", 0.10),
+        dbscan_eps=fp_cfg_dict.get("dbscan_eps", 0.15),
+        dbscan_min_samples=fp_cfg_dict.get("dbscan_min_samples", 5),
+        min_opening_length=fp_cfg_dict.get("min_opening_length", 0.3),
+        max_opening_length=fp_cfg_dict.get("max_opening_length", 2.5),
         output_dpi=fp_cfg_dict.get("output_dpi", 150),
-        snap_angle_tolerance=fp_cfg_dict.get("snap_angle_tolerance", 5.0),
-        snap_distance=fp_cfg_dict.get("snap_distance", 0.05),
+        snap_angle_tolerance=fp_cfg_dict.get("snap_angle_tolerance", 10.0),
+        snap_distance=fp_cfg_dict.get("snap_distance", 0.15),
     )
     generator = FloorPlanGenerator(fp_cfg)
     floorplan = generator.generate(points, labels)

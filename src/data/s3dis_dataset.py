@@ -9,8 +9,9 @@ Handles the Stanford Large-Scale 3D Indoor Spaces Dataset:
 The raw dataset is expected at `{root}/Area_X/room_name/*.txt` where each
 txt file contains XYZ RGB per line for one object instance.
 
-Preprocessing creates HDF5 caches of spatially-blocked, sub-sampled rooms
-so that training is I/O-efficient.
+Preprocessing creates per-area HDF5 caches that store **full rooms** (no
+sub-sampling).  Block decomposition and random point sampling happen
+on-the-fly in the Dataset so that every epoch sees different subsets.
 """
 
 from __future__ import annotations
@@ -125,6 +126,7 @@ def _decompose_blocks(
     block_size: float = 1.0,
     stride: float = 0.5,
     return_indices: bool = False,
+    full_coverage: bool = False,
 ) -> tuple[np.ndarray, ...]:
     """Shared block decomposition used by training and inference paths.
 
@@ -132,6 +134,11 @@ def _decompose_blocks(
     ----------
     points : (N, >=6) XYZ + RGB
     return_indices : if True, also return indices into the original array.
+    full_coverage  : if True (inference mode), ALL points in each block
+                     are covered by splitting into multiple sub-blocks of
+                     ``num_points`` so no point is left without a vote.
+                     If False (training / preprocessing), a single random
+                     sample per block is drawn (standard training approach).
 
     Returns
     -------
@@ -172,14 +179,34 @@ def _decompose_blocks(
             ).astype(np.float32)
 
             n = len(indices)
-            if n >= num_points:
-                choice = np.random.choice(n, num_points, replace=False)
-            else:
-                choice = np.random.choice(n, num_points, replace=True)
 
-            block_pts_list.append(bfeat[choice])
-            if return_indices:
-                block_idx_list.append(indices[choice])
+            if full_coverage:
+                # Inference: cover ALL points by splitting into sub-blocks
+                # so every point gets at least one vote.
+                order = np.arange(n)
+                np.random.shuffle(order)
+                for start in range(0, n, num_points):
+                    end = start + num_points
+                    if end <= n:
+                        choice = order[start:end]
+                    else:
+                        # Last chunk: pad with random repeats to fill
+                        remainder = order[start:]
+                        pad = np.random.choice(n, num_points - len(remainder),
+                                               replace=True)
+                        choice = np.concatenate([remainder, pad])
+                    block_pts_list.append(bfeat[choice])
+                    if return_indices:
+                        block_idx_list.append(indices[choice])
+            else:
+                # Training / preprocessing: single random sample per block
+                if n >= num_points:
+                    choice = np.random.choice(n, num_points, replace=False)
+                else:
+                    choice = np.random.choice(n, num_points, replace=True)
+                block_pts_list.append(bfeat[choice])
+                if return_indices:
+                    block_idx_list.append(indices[choice])
 
     if not block_pts_list:
         empty_pts = np.empty((0, num_points, 9), dtype=np.float32)
@@ -233,7 +260,11 @@ def preprocess_and_cache(
     block_size: float = 1.0,
     stride: float = 0.5,
 ) -> None:
-    """Preprocess all S3DIS rooms into per-area HDF5 caches."""
+    """Preprocess all S3DIS rooms into per-area HDF5 caches.
+
+    Stores **full room point clouds** (no sub-sampling) so that the
+    Dataset can draw different random subsets each epoch.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -248,32 +279,24 @@ def preprocess_and_cache(
             print(f"[skip] {h5_path} already exists")
             continue
 
-        all_pts, all_lbl = [], []
-        for room in tqdm(area_rooms, desc=f"Area {area_idx}"):
-            try:
-                points, labels = parse_room(room["path"])
-            except Exception as e:
-                print(f"  [warn] {room['name']}: {e}")
-                continue
-            bp, bl = room_to_blocks(
-                points, labels, num_points, block_size, stride
-            )
-            if bp.shape[0] == 0:
-                continue
-            all_pts.append(bp)
-            all_lbl.append(bl)
-
-        if not all_pts:
-            print(f"  [warn] Area {area_idx}: no valid blocks")
-            continue
-
-        all_pts = np.concatenate(all_pts)
-        all_lbl = np.concatenate(all_lbl)
-
+        total_pts = 0
         with h5py.File(h5_path, "w") as f:
-            f.create_dataset("points", data=all_pts, compression="gzip")
-            f.create_dataset("labels", data=all_lbl, compression="gzip")
-        print(f"[done] {h5_path}  ({all_pts.shape[0]} blocks)")
+            rooms_grp = f.create_group("rooms")
+            for room in tqdm(area_rooms, desc=f"Area {area_idx}"):
+                try:
+                    points, labels = parse_room(room["path"])
+                except Exception as e:
+                    print(f"  [warn] {room['name']}: {e}")
+                    continue
+                if len(points) == 0:
+                    continue
+                rg = rooms_grp.create_group(room["name"])
+                rg.create_dataset("points", data=points, compression="gzip")
+                rg.create_dataset("labels", data=labels, compression="gzip")
+                total_pts += len(points)
+
+        print(f"[done] {h5_path}  ({total_pts:,} points in "
+              f"{len(area_rooms)} rooms)")
 
 
 # ──────────────────────────────────────────────
@@ -281,14 +304,24 @@ def preprocess_and_cache(
 # ──────────────────────────────────────────────
 
 class S3DISDataset(Dataset):
-    """PyTorch dataset backed by preprocessed HDF5 caches.
+    """PyTorch dataset with **on-the-fly** block sampling.
+
+    New-format HDF5 files store full rooms.  At each ``__getitem__``
+    call the dataset randomly sub-samples ``num_points`` from the
+    selected block, so every epoch sees different point subsets.
+
+    Falls back to legacy format (pre-sampled static blocks) when
+    the ``rooms`` group is absent.
 
     Parameters
     ----------
     processed_dir : path to the directory containing ``area_X.h5`` files.
     test_area     : area index (1-6) held out for testing.
     split         : ``"train"`` or ``"test"``.
-    augment       : apply random rotation + jitter at training time.
+    augment       : apply data augmentation at training time.
+    num_points    : points per block sample.
+    block_size    : spatial block size in metres.
+    stride        : block stride in metres.
     """
 
     def __init__(
@@ -297,10 +330,15 @@ class S3DISDataset(Dataset):
         test_area: int = 5,
         split: str = "train",
         augment: bool = True,
+        num_points: int = 4096,
+        block_size: float = 1.0,
+        stride: float = 0.5,
     ):
         super().__init__()
         self.split = split
         self.augment = augment and (split == "train")
+        self.num_points = num_points
+        self.block_size = block_size
 
         processed_dir = Path(processed_dir)
         areas = list(range(1, 7))
@@ -309,56 +347,198 @@ class S3DISDataset(Dataset):
         else:
             areas = [test_area]
 
-        all_pts, all_lbl = [], []
+        # Try to load new-format (full rooms) first
+        self._dynamic = False
+        self.rooms: list[tuple[np.ndarray, np.ndarray, np.ndarray,
+                               np.ndarray]] = []
+        # Each entry: (points (N,6), labels (N,), coord_min (3,), room_range (3,))
+        self.blocks: list[tuple[int, np.ndarray, float, float]] = []
+        # Each entry: (room_idx, indices_into_room, gx, gy)
+
+        loaded_any = False
         for a in areas:
             h5_path = processed_dir / f"area_{a}.h5"
             if not h5_path.exists():
                 print(f"[warn] {h5_path} not found, skipping area {a}.")
                 continue
+            loaded_any = True
             with h5py.File(h5_path, "r") as f:
-                all_pts.append(f["points"][:])
-                all_lbl.append(f["labels"][:])
+                if "rooms" in f:
+                    self._dynamic = True
+                    self._load_rooms(f, block_size, stride)
+                else:
+                    # Legacy static-block format
+                    if not hasattr(self, "_legacy_pts"):
+                        self._legacy_pts: list[np.ndarray] = []
+                        self._legacy_lbl: list[np.ndarray] = []
+                    self._legacy_pts.append(f["points"][:])
+                    self._legacy_lbl.append(f["labels"][:])
 
-        if not all_pts:
+        if not loaded_any:
             raise FileNotFoundError(
                 f"No HDF5 files found in {processed_dir} for areas {areas}. "
                 f"Run preprocessing first."
             )
 
-        self.points = np.concatenate(all_pts)  # (N, P, 9)
-        self.labels = np.concatenate(all_lbl)  # (N, P)
+        if not self._dynamic:
+            # Legacy path
+            self.points = np.concatenate(self._legacy_pts)
+            self.labels = np.concatenate(self._legacy_lbl)
+            del self._legacy_pts, self._legacy_lbl
+
+    # ---- new format helpers ----
+
+    def _load_rooms(self, h5: h5py.File, block_size: float, stride: float):
+        rooms_grp = h5["rooms"]
+        for room_key in rooms_grp:
+            pts = rooms_grp[room_key]["points"][:].astype(np.float32)
+            lbl = rooms_grp[room_key]["labels"][:].astype(np.int64)
+            if len(pts) == 0:
+                continue
+            xyz = pts[:, :3]
+            coord_min = xyz.min(axis=0)
+            coord_max = xyz.max(axis=0)
+            room_range = coord_max - coord_min
+            room_range[room_range == 0] = 1.0
+
+            room_idx = len(self.rooms)
+            self.rooms.append((pts, lbl, coord_min, room_range))
+
+            # Pre-compute block membership
+            for gx in np.arange(coord_min[0], coord_max[0], stride):
+                for gy in np.arange(coord_min[1], coord_max[1], stride):
+                    mask = (
+                        (xyz[:, 0] >= gx) & (xyz[:, 0] < gx + block_size) &
+                        (xyz[:, 1] >= gy) & (xyz[:, 1] < gy + block_size)
+                    )
+                    indices = np.where(mask)[0]
+                    if len(indices) < 100:
+                        continue
+                    self.blocks.append((room_idx, indices, gx, gy))
+
+    # ---- interface ----
 
     def __len__(self) -> int:
+        if self._dynamic:
+            return len(self.blocks)
         return self.points.shape[0]
 
     def __getitem__(self, idx: int):
-        pts = self.points[idx].copy()   # (P, 9)
-        lbl = self.labels[idx].copy()   # (P,)
+        if self._dynamic:
+            return self._getitem_dynamic(idx)
+        return self._getitem_legacy(idx)
+
+    def _getitem_dynamic(self, idx: int):
+        room_idx, indices, gx, gy = self.blocks[idx]
+        pts, lbl, coord_min, room_range = self.rooms[room_idx]
+
+        # Random sub-sample — different every epoch
+        n = len(indices)
+        if n >= self.num_points:
+            choice = np.random.choice(n, self.num_points, replace=False)
+        else:
+            choice = np.random.choice(n, self.num_points, replace=True)
+        sel = indices[choice]
+
+        xyz = pts[sel, :3]
+        rgb = pts[sel, 3:6] / 255.0
+        xyz_block = xyz - np.array([gx, gy, coord_min[2]], dtype=np.float32)
+        xyz_norm = (xyz - coord_min) / room_range
+
+        feat = np.concatenate(
+            [xyz_block, rgb, xyz_norm], axis=1
+        ).astype(np.float32)
+        labels = lbl[sel].copy()
 
         if self.augment:
-            pts = self._augment(pts)
+            feat = self._augment(feat)
 
         return (
-            torch.from_numpy(pts).float(),   # (P, 9)
-            torch.from_numpy(lbl).long(),    # (P,)
+            torch.from_numpy(feat).float(),
+            torch.from_numpy(labels).long(),
+        )
+
+    def _getitem_legacy(self, idx: int):
+        pts = self.points[idx].copy()
+        lbl = self.labels[idx].copy()
+        if self.augment:
+            pts = self._augment(pts)
+        return (
+            torch.from_numpy(pts).float(),
+            torch.from_numpy(lbl).long(),
         )
 
     @staticmethod
     def _augment(pts: np.ndarray) -> np.ndarray:
-        """Random rotation around Z-axis + small jitter."""
+        """Data augmentation: rotation, scale, jitter, colour noise."""
+        # Random rotation around Z-axis
         theta = np.random.uniform(0, 2 * np.pi)
         cos, sin = np.cos(theta), np.sin(theta)
         rot = np.array([[cos, -sin, 0],
                         [sin,  cos, 0],
                         [0,    0,   1]], dtype=np.float32)
         pts[:, :3] = pts[:, :3] @ rot.T
-        # Also rotate the normalised-XYZ channels (6:9)
         pts[:, 6:9] = pts[:, 6:9] @ rot.T
-        # Small XYZ jitter
-        pts[:, :3] += np.random.normal(0, 0.01, pts[:, :3].shape).astype(
+
+        # Random scale (0.9 – 1.1)
+        scale = np.random.uniform(0.9, 1.1)
+        pts[:, :3] *= scale
+
+        # XYZ jitter
+        pts[:, :3] += np.random.normal(0, 0.02, pts[:, :3].shape).astype(
             np.float32
         )
+
+        # Colour jitter on RGB channels (3:6), clamp to [0, 1]
+        pts[:, 3:6] += np.random.normal(0, 0.05, pts[:, 3:6].shape).astype(
+            np.float32
+        )
+        np.clip(pts[:, 3:6], 0.0, 1.0, out=pts[:, 3:6])
+
+        # Random colour drop (10% chance — set RGB to 0)
+        if np.random.random() < 0.1:
+            pts[:, 3:6] = 0.0
+
         return pts
+
+
+def compute_class_weights(
+    processed_dir: str | Path,
+    test_area: int = 5,
+    num_classes: int = NUM_CLASSES,
+) -> np.ndarray:
+    """Compute sqrt-inverse-frequency class weights from the training set.
+
+    Returns
+    -------
+    weights : (num_classes,) float32 array, normalised so mean = 1.
+    """
+    processed_dir = Path(processed_dir)
+    counts = np.zeros(num_classes, dtype=np.float64)
+    areas = [a for a in range(1, 7) if a != test_area]
+
+    for a in areas:
+        h5_path = processed_dir / f"area_{a}.h5"
+        if not h5_path.exists():
+            continue
+        with h5py.File(h5_path, "r") as f:
+            if "rooms" in f:
+                for rk in f["rooms"]:
+                    lbl = f[f"rooms/{rk}/labels"][:]
+                    for c in range(num_classes):
+                        counts[c] += (lbl == c).sum()
+            else:
+                lbl = f["labels"][:]
+                for c in range(num_classes):
+                    counts[c] += (lbl == c).sum()
+
+    # Avoid division by zero for absent classes
+    counts = np.maximum(counts, 1.0)
+    total = counts.sum()
+    freq = counts / total
+    weights = 1.0 / np.sqrt(freq)
+    weights /= weights.mean()  # normalise so mean weight = 1
+    return weights.astype(np.float32)
 
 
 # ──────────────────────────────────────────────
@@ -415,7 +595,8 @@ def load_room_for_inference(
         ])
 
     result = _decompose_blocks(
-        raw_points, num_points, block_size, stride, return_indices=True
+        raw_points, num_points, block_size, stride,
+        return_indices=True, full_coverage=True,
     )
     block_points, block_indices = result
     return raw_points, block_points, block_indices

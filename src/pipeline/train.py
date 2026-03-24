@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data.s3dis_dataset import S3DISDataset, NUM_CLASSES
+from src.data.s3dis_dataset import S3DISDataset, NUM_CLASSES, compute_class_weights
 from src.models.pointnet import build_model, pointnet_loss
 
 
@@ -59,11 +59,25 @@ class Trainer:
         # Data
         ds_cfg = cfg["dataset"]
         self.train_ds = S3DISDataset(
-            ds_cfg["processed"], ds_cfg["test_area"], split="train"
+            ds_cfg["processed"], ds_cfg["test_area"], split="train",
+            num_points=ds_cfg["num_points"],
+            block_size=ds_cfg["block_size"],
+            stride=ds_cfg["stride"],
         )
         self.val_ds = S3DISDataset(
-            ds_cfg["processed"], ds_cfg["test_area"], split="test", augment=False
+            ds_cfg["processed"], ds_cfg["test_area"], split="test",
+            augment=False,
+            num_points=ds_cfg["num_points"],
+            block_size=ds_cfg["block_size"],
+            stride=ds_cfg["stride"],
         )
+
+        # Class weights for balanced loss
+        class_weights = compute_class_weights(
+            ds_cfg["processed"], ds_cfg["test_area"]
+        )
+        self.class_weights = torch.from_numpy(class_weights).float().to(self.device)
+        print(f"Class weights: {class_weights.round(2).tolist()}")
         self.train_loader = DataLoader(
             self.train_ds,
             batch_size=cfg["train"]["batch_size"],
@@ -127,7 +141,9 @@ class Trainer:
             lbl = lbl.to(self.device)    # (B, N)
 
             logits, t_feat = self.model(pts)
-            loss = pointnet_loss(logits, lbl, t_feat)
+            loss = pointnet_loss(
+                logits, lbl, t_feat, class_weights=self.class_weights
+            )
 
             self.optimizer.zero_grad()
             loss.backward()

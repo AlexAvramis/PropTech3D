@@ -11,7 +11,7 @@ env/
 # Training and app artifacts
 checkpoints/
 logs/
-outputs/
+outputs*/
 .streamlit/
 
 # Datasets and processed caches
@@ -21,6 +21,9 @@ data/processed/
 # Notebook and editor state
 .ipynb_checkpoints/
 .vscode/
+
+# Pytest
+.pytest_cache/
 
 # OS files
 Thumbs.db

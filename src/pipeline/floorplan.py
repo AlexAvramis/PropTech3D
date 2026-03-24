@@ -23,8 +23,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from shapely.geometry import LineString
-from shapely.ops import unary_union
 
 
 # ──────────────────────────────────────────────
@@ -40,8 +38,16 @@ class FloorPlanConfig:
     classes_openings: list[int] = field(default_factory=lambda: [5, 6])
     morphology_kernel: int = 5
     output_dpi: int = 150
-    snap_angle_tolerance: float = 5.0   # degrees
-    snap_distance: float = 0.05         # metres – merge nearby endpoints
+    snap_angle_tolerance: float = 10.0   # degrees – snap near-axis lines
+    snap_distance: float = 0.15          # metres – merge nearby wall lines
+    morph_dilate_iterations: int = 1
+    morph_erode_iterations: int = 1
+    hough_threshold: int = 30
+    hough_max_gap: float = 0.10          # metres
+    dbscan_eps: float = 0.15
+    dbscan_min_samples: int = 5
+    min_opening_length: float = 0.3      # metres – discard tiny openings
+    max_opening_length: float = 2.5      # metres – discard giant ghost openings
 
 
 @dataclass
@@ -140,8 +146,8 @@ class FloorPlanGenerator:
             cv2.MORPH_RECT,
             (cfg.morphology_kernel, cfg.morphology_kernel),
         )
-        wall_img = cv2.dilate(wall_img, kernel, iterations=2)
-        wall_img = cv2.erode(wall_img, kernel, iterations=1)
+        wall_img = cv2.dilate(wall_img, kernel, iterations=cfg.morph_dilate_iterations)
+        wall_img = cv2.erode(wall_img, kernel, iterations=cfg.morph_erode_iterations)
         wall_img = cv2.morphologyEx(wall_img, cv2.MORPH_CLOSE, kernel)
 
         # 6. Detect line segments (Probabilistic Hough)
@@ -150,9 +156,9 @@ class FloorPlanGenerator:
             wall_img,
             rho=1,
             theta=np.pi / 180,
-            threshold=50,
+            threshold=cfg.hough_threshold,
             minLineLength=min_line_px,
-            maxLineGap=int(0.15 / cfg.resolution),
+            maxLineGap=int(cfg.hough_max_gap / cfg.resolution),
         )
 
         wall_segments = []
@@ -213,54 +219,131 @@ class FloorPlanGenerator:
     def _merge_segments(
         self, segments: list[tuple],
     ) -> list[tuple]:
-        """Merge collinear and overlapping wall segments with Shapely."""
+        """Merge collinear and overlapping wall segments.
+
+        Groups axis-aligned segments by their perpendicular coordinate
+        (within snap_distance), then merges overlapping/adjacent extents
+        along the parallel axis.
+        """
         if not segments:
             return []
-        lines = [LineString([p1, p2]) for p1, p2 in segments]
-        # Buffer slightly to merge nearby collinear lines
-        buffered = unary_union(
-            [l.buffer(self.cfg.snap_distance) for l in lines]
-        )
-        # Extract centrelines back
-        merged = []
-        if buffered.is_empty:
-            return segments
 
-        # Use skeleton-like extraction: get boundary and simplify
-        try:
-            boundary = buffered.boundary
-            if boundary.is_empty:
-                return segments
-            if hasattr(boundary, "geoms"):
-                parts = list(boundary.geoms)
+        snap = self.cfg.snap_distance
+        min_len = self.cfg.min_wall_length
+
+        horizontal: list[tuple] = []   # (x_min, x_max, y)
+        vertical: list[tuple] = []     # (y_min, y_max, x)
+        other: list[tuple] = []        # diagonal – kept as-is
+
+        for (x1, y1), (x2, y2) in segments:
+            dx, dy = abs(x2 - x1), abs(y2 - y1)
+            if dy < 1e-9:                  # perfectly horizontal (from snap)
+                horizontal.append((min(x1, x2), max(x1, x2), (y1 + y2) / 2))
+            elif dx < 1e-9:                # perfectly vertical (from snap)
+                vertical.append((min(y1, y2), max(y1, y2), (x1 + x2) / 2))
             else:
-                parts = [boundary]
-            for part in parts:
-                coords = list(part.coords)
-                simplified = LineString(coords).simplify(self.cfg.snap_distance * 2)
-                sc = list(simplified.coords)
-                for i in range(len(sc) - 1):
-                    seg_len = np.hypot(sc[i+1][0]-sc[i][0], sc[i+1][1]-sc[i][1])
-                    if seg_len >= self.cfg.min_wall_length:
-                        merged.append((sc[i], sc[i+1]))
-        except Exception:
-            return segments
+                other.append(((x1, y1), (x2, y2)))
 
+        merged: list[tuple] = []
+
+        # ── merge horizontal segments at similar Y ──
+        horizontal.sort(key=lambda s: s[2])          # sort by Y
+        groups: list[list[tuple]] = []
+        for seg in horizontal:
+            placed = False
+            for group in groups:
+                if abs(seg[2] - np.mean([s[2] for s in group])) <= snap:
+                    group.append(seg)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([seg])
+
+        for group in groups:
+            y_avg = float(np.mean([s[2] for s in group]))
+            intervals = sorted([(s[0], s[1]) for s in group])
+            mi = [intervals[0]]
+            for lo, hi in intervals[1:]:
+                if lo <= mi[-1][1] + snap:
+                    mi[-1] = (mi[-1][0], max(mi[-1][1], hi))
+                else:
+                    mi.append((lo, hi))
+            for lo, hi in mi:
+                if hi - lo >= min_len:
+                    merged.append(((lo, y_avg), (hi, y_avg)))
+
+        # ── merge vertical segments at similar X ──
+        vertical.sort(key=lambda s: s[2])            # sort by X
+        groups = []
+        for seg in vertical:
+            placed = False
+            for group in groups:
+                if abs(seg[2] - np.mean([s[2] for s in group])) <= snap:
+                    group.append(seg)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([seg])
+
+        for group in groups:
+            x_avg = float(np.mean([s[2] for s in group]))
+            intervals = sorted([(s[0], s[1]) for s in group])
+            mi = [intervals[0]]
+            for lo, hi in intervals[1:]:
+                if lo <= mi[-1][1] + snap:
+                    mi[-1] = (mi[-1][0], max(mi[-1][1], hi))
+                else:
+                    mi.append((lo, hi))
+            for lo, hi in mi:
+                if hi - lo >= min_len:
+                    merged.append(((x_avg, lo), (x_avg, hi)))
+
+        # keep diagonal segments unchanged
+        merged.extend(other)
         return merged if merged else segments
 
     def _opening_segments(self, xy: np.ndarray) -> list[tuple]:
         """Cluster opening points into segments via PCA per cluster."""
         from sklearn.cluster import DBSCAN
+        from scipy.spatial import cKDTree
 
         if xy.shape[0] < 3:
             return []
 
-        clustering = DBSCAN(eps=0.3, min_samples=5).fit(xy)
+        # Subsample for DBSCAN efficiency (>10K points is slow)
+        max_pts = 10_000
+        if xy.shape[0] > max_pts:
+            idx = np.random.choice(xy.shape[0], max_pts, replace=False)
+            xy_sample = xy[idx]
+        else:
+            xy_sample = xy
+            idx = np.arange(xy.shape[0])
+
+        clustering = DBSCAN(
+            eps=self.cfg.dbscan_eps,
+            min_samples=self.cfg.dbscan_min_samples,
+        ).fit(xy_sample)
+
+        n_clusters = len(set(clustering.labels_) - {-1})
+        if n_clusters == 0:
+            return []
+
+        # Assign ALL original points to their nearest cluster via KDTree
+        # Only use the labelled (non-noise) subsample points as reference
+        labelled_mask = clustering.labels_ != -1
+        ref_pts = xy_sample[labelled_mask]
+        ref_labels = clustering.labels_[labelled_mask]
+        tree = cKDTree(ref_pts)
+        dists, nn_idx = tree.query(xy, k=1)
+        all_labels = ref_labels[nn_idx]
+        # Points too far from any cluster stay unassigned
+        all_labels[dists > self.cfg.dbscan_eps * 3] = -1
+
         segments = []
-        for cid in set(clustering.labels_):
-            if cid == -1:
+        for cid in range(n_clusters):
+            cluster = xy[all_labels == cid]
+            if len(cluster) < self.cfg.dbscan_min_samples:
                 continue
-            cluster = xy[clustering.labels_ == cid]
             # PCA main axis → line segment
             mean = cluster.mean(axis=0)
             centered = cluster - mean
@@ -270,6 +353,11 @@ class FloorPlanGenerator:
             proj = centered @ main_axis
             p1 = mean + main_axis * proj.min()
             p2 = mean + main_axis * proj.max()
+            seg_len = np.linalg.norm(p2 - p1)
+            if seg_len < self.cfg.min_opening_length:
+                continue
+            if seg_len > self.cfg.max_opening_length:
+                continue
             segments.append((tuple(p1), tuple(p2)))
 
         return segments
