@@ -281,7 +281,7 @@ def main():
     with col_3d:
         st.subheader("3D Segmented Room")
         fig_3d = build_3d_figure(raw_points, labels, max_display=max_points)
-        st.plotly_chart(fig_3d, use_container_width=True)
+        st.plotly_chart(fig_3d, width='stretch')
 
     with col_fp:
         st.subheader("2D Floor Plan")
@@ -290,7 +290,7 @@ def main():
         with st.spinner("Generating floor plan…"):
             fp_image, floorplan = build_floorplan(raw_points, labels, fp_cfg_dict)
 
-        st.image(fp_image, use_container_width=True)
+        st.image(fp_image, width='stretch')
 
         st.caption(
             f"Walls: {len(floorplan.walls)} · "
