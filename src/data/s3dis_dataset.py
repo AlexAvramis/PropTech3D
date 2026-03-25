@@ -22,7 +22,7 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 # S3DIS class list (official ordering)
 S3DIS_CLASSES = [
@@ -307,8 +307,10 @@ class S3DISDataset(Dataset):
     """PyTorch dataset with **on-the-fly** block sampling.
 
     New-format HDF5 files store full rooms.  At each ``__getitem__``
-    call the dataset randomly sub-samples ``num_points`` from the
-    selected block, so every epoch sees different point subsets.
+    call the dataset reads a room from disk lazily, masks out
+    the requested block, and randomly sub-samples ``num_points``,
+    so every epoch sees different point subsets without loading
+    everything into RAM.
 
     Falls back to legacy format (pre-sampled static blocks) when
     the ``rooms`` group is absent.
@@ -339,6 +341,7 @@ class S3DISDataset(Dataset):
         self.augment = augment and (split == "train")
         self.num_points = num_points
         self.block_size = block_size
+        self._stride = stride
 
         processed_dir = Path(processed_dir)
         areas = list(range(1, 7))
@@ -349,11 +352,14 @@ class S3DISDataset(Dataset):
 
         # Try to load new-format (full rooms) first
         self._dynamic = False
-        self.rooms: list[tuple[np.ndarray, np.ndarray, np.ndarray,
-                               np.ndarray]] = []
-        # Each entry: (points (N,6), labels (N,), coord_min (3,), room_range (3,))
-        self.blocks: list[tuple[int, np.ndarray, float, float]] = []
-        # Each entry: (room_idx, indices_into_room, gx, gy)
+        # Room metadata (lazy): (h5_path, room_key, coord_min, room_range)
+        self._room_meta: list[tuple[str, str, np.ndarray, np.ndarray]] = []
+        # Block list: (room_idx, gx, gy)
+        self.blocks: list[tuple[int, float, float]] = []
+        # LRU cache for loaded rooms: room_idx → (points, labels)
+        self._room_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._cache_order: list[int] = []
+        self._max_cached_rooms = 250  # keep all rooms in RAM after first load
 
         loaded_any = False
         for a in areas:
@@ -365,7 +371,7 @@ class S3DISDataset(Dataset):
             with h5py.File(h5_path, "r") as f:
                 if "rooms" in f:
                     self._dynamic = True
-                    self._load_rooms(f, block_size, stride)
+                    self._scan_rooms(str(h5_path), f, stride)
                 else:
                     # Legacy static-block format
                     if not hasattr(self, "_legacy_pts"):
@@ -386,35 +392,123 @@ class S3DISDataset(Dataset):
             self.labels = np.concatenate(self._legacy_lbl)
             del self._legacy_pts, self._legacy_lbl
 
+        if self._dynamic:
+            print(f"  [{split}] {len(self._room_meta)} rooms, "
+                  f"{len(self.blocks)} blocks")
+
     # ---- new format helpers ----
 
-    def _load_rooms(self, h5: h5py.File, block_size: float, stride: float):
+    def _scan_rooms(self, h5_path: str, h5: h5py.File, stride: float):
+        """Read only room bounding boxes — no point data loaded."""
         rooms_grp = h5["rooms"]
         for room_key in rooms_grp:
-            pts = rooms_grp[room_key]["points"][:].astype(np.float32)
-            lbl = rooms_grp[room_key]["labels"][:].astype(np.int64)
-            if len(pts) == 0:
+            rg = rooms_grp[room_key]
+            # Read only XYZ columns to get bounding box
+            pts_ds = rg["points"]
+            n_pts = pts_ds.shape[0]
+            if n_pts == 0:
                 continue
-            xyz = pts[:, :3]
-            coord_min = xyz.min(axis=0)
-            coord_max = xyz.max(axis=0)
+
+            # Read just XYZ (first 3 cols) in chunks to get min/max
+            # without loading the full room
+            chunk = min(n_pts, 50_000)
+            coord_min = np.full(3, np.inf, dtype=np.float32)
+            coord_max = np.full(3, -np.inf, dtype=np.float32)
+            for start in range(0, n_pts, chunk):
+                end = min(start + chunk, n_pts)
+                xyz_chunk = pts_ds[start:end, :3]
+                coord_min = np.minimum(coord_min, xyz_chunk.min(axis=0))
+                coord_max = np.maximum(coord_max, xyz_chunk.max(axis=0))
+
             room_range = coord_max - coord_min
             room_range[room_range == 0] = 1.0
 
-            room_idx = len(self.rooms)
-            self.rooms.append((pts, lbl, coord_min, room_range))
+            room_idx = len(self._room_meta)
+            self._room_meta.append(
+                (h5_path, room_key, coord_min.copy(), room_range.copy())
+            )
 
-            # Pre-compute block membership
-            for gx in np.arange(coord_min[0], coord_max[0], stride):
-                for gy in np.arange(coord_min[1], coord_max[1], stride):
-                    mask = (
-                        (xyz[:, 0] >= gx) & (xyz[:, 0] < gx + block_size) &
-                        (xyz[:, 1] >= gy) & (xyz[:, 1] < gy + block_size)
-                    )
-                    indices = np.where(mask)[0]
-                    if len(indices) < 100:
-                        continue
-                    self.blocks.append((room_idx, indices, gx, gy))
+            # Enumerate grid cell origins
+            grid_x = np.arange(coord_min[0], coord_max[0], stride)
+            grid_y = np.arange(coord_min[1], coord_max[1], stride)
+            for gx in grid_x:
+                for gy in grid_y:
+                    self.blocks.append((room_idx, float(gx), float(gy)))
+
+    def _get_room(self, room_idx: int) -> tuple[np.ndarray, np.ndarray, dict]:
+        """Load a room's points+labels+grid index, with LRU caching.
+
+        Returns
+        -------
+        pts : (N, 6) float32
+        lbl : (N,) int64
+        grid : dict mapping (ix, iy) → np.ndarray of point indices
+        """
+        if room_idx in self._room_cache:
+            return self._room_cache[room_idx]
+
+        # Evict oldest if cache is full
+        while len(self._cache_order) >= self._max_cached_rooms:
+            old_idx = self._cache_order.pop(0)
+            self._room_cache.pop(old_idx, None)
+
+        h5_path, room_key, coord_min, _ = self._room_meta[room_idx]
+        with h5py.File(h5_path, "r") as f:
+            pts = f[f"rooms/{room_key}/points"][:].astype(np.float32)
+            lbl = f[f"rooms/{room_key}/labels"][:].astype(np.int64)
+
+        # Build grid index: sort points by 2-D cell, then split.
+        # This avoids per-cell boolean masks over the full array.
+        xyz = pts[:, :3]
+        stride = self._stride
+        bs = self.block_size
+
+        # Assign each point to its primary grid cell (floor division)
+        ix_arr = np.floor((xyz[:, 0] - coord_min[0]) / stride).astype(np.int32)
+        iy_arr = np.floor((xyz[:, 1] - coord_min[1]) / stride).astype(np.int32)
+
+        # Encode cell as single int64 key, sort once
+        keys = ix_arr.astype(np.int64) * 100000 + iy_arr.astype(np.int64)
+        order = np.argsort(keys)
+        keys_sorted = keys[order]
+
+        # Split sorted indices at cell boundaries
+        splits = np.where(np.diff(keys_sorted) != 0)[0] + 1
+        groups = np.split(order, splits)  # order already contains pt indices
+        key_vals = keys_sorted[np.concatenate([[0], splits])]
+
+        primary: dict[tuple[int, int], np.ndarray] = {}
+        for k, g in zip(key_vals, groups):
+            primary[(int(k // 100000), int(k % 100000))] = g
+
+        # Expand to overlapping cells: each block covers span cells.
+        # A block at (bx, by) needs points from primary cells
+        # (bx .. bx + span-1, by .. by + span-1).
+        span = max(1, int(np.ceil(bs / stride)))
+        grid: dict[tuple[int, int], np.ndarray] = {}
+
+        # Collect unique cell coords from primary
+        all_cells = np.column_stack([key_vals // 100000, key_vals % 100000])
+        # Get the range of block origins that could contain each primary cell
+        bx_min = int(all_cells[:, 0].min())
+        bx_max = int(all_cells[:, 0].max())
+        by_min = int(all_cells[:, 1].min())
+        by_max = int(all_cells[:, 1].max())
+
+        for bx in range(bx_min, bx_max + 1):
+            for by in range(by_min, by_max + 1):
+                parts = []
+                for di in range(span):
+                    for dj in range(span):
+                        g = primary.get((bx + di, by + dj))
+                        if g is not None:
+                            parts.append(g)
+                if parts:
+                    grid[(bx, by)] = np.concatenate(parts) if len(parts) > 1 else parts[0]
+
+        self._room_cache[room_idx] = (pts, lbl, grid)
+        self._cache_order.append(room_idx)
+        return pts, lbl, grid
 
     # ---- interface ----
 
@@ -429,8 +523,18 @@ class S3DISDataset(Dataset):
         return self._getitem_legacy(idx)
 
     def _getitem_dynamic(self, idx: int):
-        room_idx, indices, gx, gy = self.blocks[idx]
-        pts, lbl, coord_min, room_range = self.rooms[room_idx]
+        room_idx, gx, gy = self.blocks[idx]
+        _, _, coord_min, room_range = self._room_meta[room_idx]
+        pts, lbl, grid = self._get_room(room_idx)
+
+        # Grid-index lookup: O(1) instead of scanning all room points
+        ix = int(round((gx - coord_min[0]) / self._stride))
+        iy = int(round((gy - coord_min[1]) / self._stride))
+        indices = grid.get((ix, iy))
+
+        # If block is too sparse or missing, fall back to a random block
+        if indices is None or len(indices) < 100:
+            return self._getitem_dynamic(np.random.randint(len(self.blocks)))
 
         # Random sub-sample — different every epoch
         n = len(indices)
@@ -493,7 +597,7 @@ class S3DISDataset(Dataset):
         pts[:, 3:6] += np.random.normal(0, 0.05, pts[:, 3:6].shape).astype(
             np.float32
         )
-        np.clip(pts[:, 3:6], 0.0, 1.0, out=pts[:, 3:6])
+        pts[:, 3:6] = np.clip(pts[:, 3:6], 0.0, 1.0)
 
         # Random colour drop (10% chance — set RGB to 0)
         if np.random.random() < 0.1:
@@ -600,3 +704,44 @@ def load_room_for_inference(
     )
     block_points, block_indices = result
     return raw_points, block_points, block_indices
+
+
+# ──────────────────────────────────────────────
+#  Room-grouped sampler (minimises cold cache misses)
+# ──────────────────────────────────────────────
+
+class RoomGroupedSampler(Sampler[int]):
+    """Sampler that groups blocks by room, shuffles rooms and intra-room
+    blocks each epoch.  This minimises cold-cache HDF5 reads in the
+    DataLoader because consecutive batches tend to share the same room.
+
+    Usage::
+
+        sampler = RoomGroupedSampler(dataset)
+        loader  = DataLoader(dataset, batch_size=32, sampler=sampler)
+    """
+
+    def __init__(self, dataset: S3DISDataset):
+        self._blocks = dataset.blocks  # list of (room_idx, gx, gy)
+
+    def __len__(self) -> int:
+        return len(self._blocks)
+
+    def __iter__(self):
+        # Group block indices by room
+        from collections import defaultdict
+        room_to_idx: dict[int, list[int]] = defaultdict(list)
+        for i, (room_idx, _, _) in enumerate(self._blocks):
+            room_to_idx[room_idx].append(i)
+
+        # Shuffle rooms, shuffle blocks within each room
+        room_ids = list(room_to_idx.keys())
+        np.random.shuffle(room_ids)
+
+        indices: list[int] = []
+        for rid in room_ids:
+            block_idxs = room_to_idx[rid]
+            np.random.shuffle(block_idxs)
+            indices.extend(block_idxs)
+
+        return iter(indices)

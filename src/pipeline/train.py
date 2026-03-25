@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data.s3dis_dataset import S3DISDataset, NUM_CLASSES, compute_class_weights
+from src.data.s3dis_dataset import S3DISDataset, NUM_CLASSES, compute_class_weights, RoomGroupedSampler
 from src.models.pointnet import build_model, pointnet_loss
 
 
@@ -81,7 +81,7 @@ class Trainer:
         self.train_loader = DataLoader(
             self.train_ds,
             batch_size=cfg["train"]["batch_size"],
-            shuffle=True,
+            sampler=RoomGroupedSampler(self.train_ds),
             num_workers=cfg["train"]["num_workers"],
             pin_memory=True,
             drop_last=True,
